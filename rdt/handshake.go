@@ -26,7 +26,7 @@ func (s *Session) handshakeClient(ctx context.Context) error {
 				return ErrHandshake
 			}
 			if f.Kind == KindSynAck && f.Epoch == s.epoch {
-				s.sndWin = f.Window
+				s.streams[defaultStreamID].sndWin = f.Window
 				return nil
 			}
 			// stale/stray frame: keep trying
@@ -54,9 +54,9 @@ func (s *Session) handshakeServer(ctx context.Context) error {
 			}
 			s.epoch = f.Epoch
 			if f.Window > 0 {
-				s.sndWin = f.Window
+				s.streams[defaultStreamID].sndWin = f.Window
 			}
-			synack := Frame{Kind: KindSynAck, Window: uint64(s.cfg.RecvBuffer)}
+			synack := Frame{Kind: KindSynAck, Stream: defaultStreamID, Window: uint64(s.cfg.RecvBuffer)}
 			// Answer; repeated SYNs (lost SYNACK) trigger repeated answers.
 			s.send(synack)
 			return nil

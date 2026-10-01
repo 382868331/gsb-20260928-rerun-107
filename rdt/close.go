@@ -5,55 +5,23 @@ import (
 	"time"
 )
 
-// Close flushes queued data, sends FIN and waits for the peer's FinAck.
-// It is idempotent. If the peer already sent its FIN first, Close lingers
-// and answers retransmitted FINs until the peer goes quiet (meaning it
-// received a FinAck) or ctx is cancelled, which then aborts the session
-// and unwinds blocked Read/Write on both sides.
+// Close half-closes the legacy stream send direction. Receiving stays open.
 func (s *Session) Close(ctx context.Context) error {
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		return nil
-	}
-	if s.peerFin {
-		s.mu.Unlock()
-		return s.closePassive(ctx)
-	}
-	s.finQueued = true
-	s.state = stateFinWait
-	s.kick()
-	s.mu.Unlock()
-
-	ticker := time.NewTicker(s.cfg.RTO)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			s.abort()
-			return ctx.Err()
-		case <-s.done:
-			return nil
-		case <-ticker.C:
-			// Retransmit any still-unacked data and the FIN once sequenced.
-			s.mu.Lock()
-			now := time.Now()
-			for _, seg := range s.segments {
-				if now.Sub(seg.sentAt) >= s.cfg.RTO/2 {
-					seg.sentAt = now
-					s.sendLocked(Frame{Kind: KindData, Seq: seg.seq, Payload: seg.data})
-				}
-			}
-			if s.finSent {
-				s.sendLocked(Frame{Kind: KindFin, Seq: s.sndNxt})
-			}
-			s.mu.Unlock()
-		}
-	}
+	return s.closeWriteStream(ctx, defaultStreamID, false)
 }
 
-// closePassive keeps answering FIN retransmits until the peer is quiet
-// for CloseGrace, so the active side reliably gets at least one FinAck.
+// CloseAndWait flushes and waits for FINACK or peer close.
+func (s *Session) CloseAndWait(ctx context.Context) error {
+	s.mu.Lock()
+	st := s.streams[defaultStreamID]
+	passive := st != nil && st.peerFin && !st.finSent
+	s.mu.Unlock()
+	if passive {
+		return s.closePassive(ctx)
+	}
+	return s.closeWriteStream(ctx, defaultStreamID, true)
+}
+
 func (s *Session) closePassive(ctx context.Context) error {
 	tick := time.NewTicker(s.cfg.RTO / 2)
 	defer tick.Stop()
@@ -64,10 +32,18 @@ func (s *Session) closePassive(ctx context.Context) error {
 			return ctx.Err()
 		case <-tick.C:
 			s.mu.Lock()
-			quiet := !time.Now().Before(s.finQuietUntil)
+			st := s.streams[defaultStreamID]
+			quiet := st == nil || !time.Now().Before(st.finQuietUntil)
+			if quiet && st != nil && len(st.rcvBuf) == 0 {
+				st.readEOF = true
+			}
+			if quiet && st != nil {
+				st.writeClosed = true
+				st.localFinished = true
+				s.maybeFinishLocked()
+			}
 			s.mu.Unlock()
 			if quiet {
-				s.finishPassive()
 				return nil
 			}
 		}
@@ -83,26 +59,14 @@ func (s *Session) abort() {
 	s.state = stateClosed
 	s.closed = true
 	s.recvErr = ErrClosed
+	for _, st := range s.streams {
+		st.peerReset = true
+	}
 	close(s.done)
 	s.kick()
 	s.mu.Unlock()
-	// Tear down the transport so the peer's Recv unblocks and both sides
-	// wind down. The unreliable transport is shared by design; cancellation
-	// means the whole connection is over.
 	_ = s.conn.Close()
 }
 
-// finishPassive ends a session that only answered the peer's FIN.
-func (s *Session) finishPassive() {
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		return
-	}
-	s.state = stateClosed
-	s.closed = true
-	s.readEOF = true
-	close(s.done)
-	s.kick()
-	s.mu.Unlock()
-}
+// Abort terminates the entire connection.
+func (s *Session) Abort() { s.abort() }

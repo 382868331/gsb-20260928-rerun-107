@@ -10,6 +10,8 @@ type Config struct {
 	SendBuffer int
 	// RecvBuffer bounds receiver bytes held (ordered + out of order).
 	RecvBuffer int
+	// MaxStreams bounds how many remotely initiated streams may exist at once.
+	MaxStreams int
 	// HandshakeTimeout bounds a single handshake step retransmission wait.
 	HandshakeTimeout time.Duration
 	// RTO is the retransmission timeout for data and FIN segments.

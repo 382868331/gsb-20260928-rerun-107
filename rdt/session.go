@@ -36,29 +36,15 @@ type Session struct {
 	cond    *sync.Cond
 	state   state
 	closed  bool
-	readEOF bool
-	peerFin bool
 	recvErr error
 
-	// send side
-	sndUna        uint64             // oldest unacknowledged byte
-	sndNxt        uint64             // next byte to hand to the transport
-	sndWin        uint64             // peer advertised receive window
-	segments      map[uint64]*outSeg // in-flight segments keyed by Seq
-	queued        []byte             // accepted but not yet sent
-	finQueued     bool
-	finSent       bool
-	finQuietUntil time.Time
-
-	// receive side
-	rcvNxt       uint64    // next in-order byte expected
-	rcvBuf       []byte    // in-order bytes not yet Read
-	rcvHold      []heldSeg // out-of-order, disjoint, sorted
-	rcvHoldBytes uint64
-
-	timerDead  time.Time
-	probeDead  time.Time
-	finAckDead time.Time
+	streams       map[uint32]*streamState
+	streamOrder   []uint32
+	sendCursor    int
+	nextLocalID   uint32
+	maxStreams    int
+	remoteStreams int
+	acceptedCh    chan *Stream
 
 	rxFrames chan Frame
 	txFrames chan Frame
@@ -73,6 +59,8 @@ type outSeg struct {
 	data   []byte
 	sentAt time.Time
 }
+
+const defaultStreamID = uint32(0)
 
 // Dial opens a session as the active (client) side over conn.
 func Dial(parent context.Context, conn Transport, cfg Config) (*Session, error) {
@@ -117,23 +105,70 @@ func newSession(conn Transport, cfg Config, _ bool, epoch uint64) (*Session, err
 		return nil, errors.New("rdt: nil transport")
 	}
 	s := &Session{
-		conn:     conn,
-		cfg:      cfg.withDefaults(),
-		epoch:    epoch,
-		sndWin:   0,
-		segments: make(map[uint64]*outSeg),
-		rxFrames: make(chan Frame, 256),
-		txFrames: make(chan Frame, 4096),
-		txCtrl:   make(chan Frame, 4096),
-		done:     make(chan struct{}),
-		rxDone:   make(chan struct{}),
+		conn:       conn,
+		cfg:        cfg.withDefaults(),
+		epoch:      epoch,
+		streams:    make(map[uint32]*streamState),
+		acceptedCh: make(chan *Stream, 128),
+		rxFrames:   make(chan Frame, 256),
+		txFrames:   make(chan Frame, 4096),
+		txCtrl:     make(chan Frame, 4096),
+		done:       make(chan struct{}),
+		rxDone:     make(chan struct{}),
 	}
+	s.maxStreams = s.cfg.MaxStreams
+	if s.maxStreams <= 0 {
+		s.maxStreams = 1024
+	}
+	s.streams[defaultStreamID] = newStreamState(defaultStreamID, 0)
+	s.streamOrder = append(s.streamOrder, defaultStreamID)
+	s.nextLocalID = 1
 	s.cond = sync.NewCond(&s.mu)
 	s.wg.Add(1)
 	go s.readLoop()
 	s.wg.Add(1)
 	go s.writeLoop()
 	return s, nil
+}
+
+// OpenStream creates a locally initiated independent bidirectional stream.
+func (s *Session) OpenStream() *Stream {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id := s.nextLocalID
+	s.nextLocalID += 2
+	s.streams[id] = newStreamState(id, uint64(s.cfg.RecvBuffer))
+	s.streamOrder = append(s.streamOrder, id)
+	return &Stream{s: s, id: id}
+}
+
+// AcceptStream returns a stream initiated by the peer. The default stream
+// is implicit and is not delivered here.
+func (s *Session) AcceptStream() (*Stream, error) {
+	select {
+	case st := <-s.acceptedCh:
+		return st, nil
+	case <-s.done:
+		return nil, ErrClosed
+	}
+}
+
+func (s *Session) getOrCreatePeerStreamLocked(id uint32) *streamState {
+	if st, ok := s.streams[id]; ok {
+		return st
+	}
+	if id == defaultStreamID || s.remoteStreams >= s.maxStreams {
+		return nil
+	}
+	st := newStreamState(id, uint64(s.cfg.RecvBuffer))
+	s.streams[id] = st
+	s.streamOrder = append(s.streamOrder, id)
+	s.remoteStreams++
+	select {
+	case s.acceptedCh <- &Stream{s: s, id: id}:
+	default:
+	}
+	return st
 }
 
 func (s *Session) send(f Frame) {
