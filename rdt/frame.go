@@ -10,6 +10,7 @@ const (
 	KindAck
 	KindFin
 	KindFinAck
+	KindRst
 )
 
 // Frame is the wire-level message. Epoch identifies the connection
@@ -17,6 +18,9 @@ const (
 type Frame struct {
 	Kind  FrameKind
 	Epoch uint64
+	// Stream identifies the independent bidirectional byte stream inside
+	// one connection. Stream 1 is the bootstrap stream used by Session.
+	Stream uint32
 
 	// Data frames: Seq is the first byte; the count is len(Payload).
 	// Ack frames: Ack is the next expected byte (cumulative).
