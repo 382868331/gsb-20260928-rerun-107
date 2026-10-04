@@ -63,18 +63,19 @@ func (s *Session) sendSegmentLocked(id uint32, st *streamState) int {
 	if effWin > uint64(s.cfg.SendBuffer) {
 		effWin = uint64(s.cfg.SendBuffer)
 	}
-	if used >= effWin || len(st.queued) == 0 {
+	if used >= effWin || st.queuedLen() == 0 {
 		return 0
 	}
 	avail := effWin - used
 	n := s.cfg.MaxSegment
-	if n > len(st.queued) {
-		n = len(st.queued)
+	head := &st.queued[0]
+	if n > len(head.data) {
+		n = len(head.data)
 	}
 	if uint64(n) > avail {
 		n = int(avail)
 	}
-	room := s.quotaRoomLocked(s.groupLocked(st.group))
+	room := s.quotaRoomLocked(s.groupLocked(head.group))
 	if room <= 0 {
 		return 0
 	}
@@ -82,9 +83,12 @@ func (s *Session) sendSegmentLocked(id uint32, st *streamState) int {
 		n = int(room)
 	}
 	data := make([]byte, n)
-	copy(data, st.queued[:n])
-	st.queued = st.queued[n:]
-	seg := &outSeg{seq: st.sndNxt, data: data, sentAt: time.Now()}
+	copy(data, head.data[:n])
+	head.data = head.data[n:]
+	if len(head.data) == 0 {
+		st.queued = st.queued[1:]
+	}
+	seg := &outSeg{seq: st.sndNxt, data: data, sentAt: time.Now(), group: head.group}
 	st.segments[seg.seq] = seg
 	st.sndNxt += uint64(n)
 	s.chargeSendLocked(st, seg)
@@ -98,7 +102,7 @@ func (s *Session) pumpFinLocked(id uint32, st *streamState) {
 	if st.resetSent || st.peerReset || st.writeClosed {
 		return
 	}
-	if st.finQueued && !st.finSent && len(st.queued) == 0 && len(st.segments) == 0 &&
+	if st.finQueued && !st.finSent && st.queuedLen() == 0 && len(st.segments) == 0 &&
 		(st.sndNxt-st.sndUna == 0) {
 		st.finSent = true
 		s.sendLocked(Frame{Kind: KindFin, Stream: id, Seq: st.sndNxt, Ack: st.rcvNxt, Window: s.availWindowLocked(id)})
@@ -143,7 +147,7 @@ func (s *Session) onRTO() {
 			st.timerDead = now.Add(s.cfg.RTO)
 			continue
 		}
-		if st.peerFin && len(st.segments) == 0 && len(st.queued) == 0 && st.localAcked && !st.finSent && !st.resetSent {
+		if st.peerFin && len(st.segments) == 0 && st.queuedLen() == 0 && st.localAcked && !st.finSent && !st.resetSent {
 			s.sendLocked(Frame{Kind: KindFinAck, Stream: id, Ack: st.rcvNxt, Window: s.availWindowLocked(id)})
 			st.finAckDead = now.Add(s.cfg.RTO)
 			continue
@@ -183,7 +187,7 @@ func (s *Session) advanceAckLocked(f Frame) {
 	st.sndWin = f.Window
 	if f.Window > 0 {
 		st.probeDead = time.Time{}
-	} else if (len(st.queued) > 0 || st.finQueued) && st.probeDead.IsZero() {
+	} else if (st.queuedLen() > 0 || st.finQueued) && st.probeDead.IsZero() {
 		st.probeDead = time.Now().Add(s.cfg.RTO)
 	}
 	if f.Ack > st.sndUna && f.Ack <= st.sndNxt {
@@ -308,7 +312,9 @@ func (s *Session) writeStream(id uint32, p []byte) (int, error) {
 		if uint64(n) > space {
 			n = int(space)
 		}
-		st.queued = append(st.queued, p[:n]...)
+		chunk := make([]byte, n)
+		copy(chunk, p[:n])
+		st.queued = append(st.queued, queuedChunk{group: st.group, data: chunk})
 		s.pumpAllLocked()
 		s.mu.Unlock()
 		p = p[n:]

@@ -16,7 +16,7 @@ type streamState struct {
 	sndNxt        uint64
 	sndWin        uint64
 	segments      map[uint64]*outSeg
-	queued        []byte
+	queued        []queuedChunk
 	finQueued     bool
 	finSent       bool
 	localAcked    bool
@@ -50,8 +50,25 @@ func newStreamState(id uint32, initialWindow uint64) *streamState {
 	}
 }
 
+// queuedChunk is a run of written bytes pinned to the business group the
+// stream belonged to when they were queued. Later group switches only
+// append new chunks, so a segment formed from a chunk keeps the group of
+// its write.
+type queuedChunk struct {
+	group uint32
+	data  []byte
+}
+
+func (st *streamState) queuedLen() int {
+	n := 0
+	for _, c := range st.queued {
+		n += len(c.data)
+	}
+	return n
+}
+
 func (st *streamState) outstanding() uint64 {
-	n := uint64(len(st.queued))
+	n := uint64(st.queuedLen())
 	for _, seg := range st.segments {
 		n += uint64(len(seg.data))
 	}
@@ -71,9 +88,10 @@ type Stream struct {
 // ID returns the stream's connection-unique identifier.
 func (st *Stream) ID() uint32 { return st.id }
 
-// SetGroup moves the stream to a business group. Only sends made after
-// the switch are charged to the new group; earlier occupancy,
-// acknowledgements and cancellation stay with the group that sent them.
+// SetGroup moves the stream to a business group. Only bytes written after
+// the switch are charged to the new group; earlier queued and sent bytes
+// keep their original group, and occupancy, acknowledgements and
+// cancellation stay with the group that sent them.
 func (st *Stream) SetGroup(g uint32) { _ = st.s.SetStreamGroup(st.id, g) }
 
 // Group returns the stream's current business group.

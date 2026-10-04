@@ -272,6 +272,100 @@ func TestGroupSwitchAttributesCharges(t *testing.T) {
 	}
 }
 
+func TestGroupSwitchPinsQueuedBytes(t *testing.T) {
+	c := sim.Config{LossRate: 0.1, MinDelay: 20 * time.Millisecond, MaxDelay: 40 * time.Millisecond}
+	pair := sim.NewPair(60221, c, c)
+	cfg := groupCfg()
+	cfg.MaxSegment = 4
+	cfg.SendBuffer = 64
+	cfg.RecvBuffer = 64
+	cfg.GroupQuota = 4 // one segment in flight at a time
+
+	oldGroup := makePayload(6)
+	newGroup := makePayload(10)
+	full := append(append([]byte{}, oldGroup...), newGroup...)
+	srvErr := make(chan error, 1)
+	go func() {
+		srv, err := rdt.Accept(context.Background(), pair.B, cfg)
+		if err != nil {
+			srvErr <- err
+			return
+		}
+		var got bytes.Buffer
+		_, _ = io.CopyBuffer(&got, srv, make([]byte, 3))
+		if !bytes.Equal(got.Bytes(), full) {
+			srvErr <- io.ErrShortBuffer
+			return
+		}
+		srvErr <- nil
+	}()
+
+	cli, err := rdt.Dial(context.Background(), pair.A, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cli.SetStreamGroup(0, 1); err != nil {
+		t.Fatal(err)
+	}
+	// Quota 4 with MSS 4: the first segment goes in flight, the last 2
+	// bytes stay queued. Switching groups now must not move them.
+	if _, err := cli.Write(oldGroup); err != nil {
+		t.Fatal(err)
+	}
+	if err := cli.SetStreamGroup(0, 2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cli.Write(newGroup); err != nil {
+		t.Fatal(err)
+	}
+	// Shrink the budget below the in-flight level mid-transfer; existing
+	// charges keep their group and only new sends pause.
+	cli.SetTotalQuota(8)
+	time.Sleep(10 * time.Millisecond)
+	cli.SetTotalQuota(4)
+	if err := cli.CloseWrite(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := cli.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-srvErr:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("server did not finish")
+	}
+
+	g1 := cli.GroupStats(1)
+	if g1.Sent != uint64(len(oldGroup)) || g1.Acked != g1.Sent || g1.Inflight != 0 || g1.Dropped != 0 {
+		t.Fatalf("group 1 (old) stats: %+v, want sent=acked=%d", g1, len(oldGroup))
+	}
+	g2 := cli.GroupStats(2)
+	if g2.Sent != uint64(len(newGroup)) || g2.Acked != g2.Sent || g2.Inflight != 0 || g2.Dropped != 0 {
+		t.Fatalf("group 2 (new) stats: %+v, want sent=acked=%d", g2, len(newGroup))
+	}
+	for id, g := range map[uint32]rdt.GroupStats{1: g1, 2: g2} {
+		if g.Sent != g.Acked+g.Inflight+g.Dropped {
+			t.Fatalf("group %d ledger unbalanced: %+v", id, g)
+		}
+	}
+	st, ok := cli.StreamStats(0)
+	if !ok {
+		t.Fatal("stream stats missing")
+	}
+	if st.Sent != uint64(len(full)) || st.Acked != st.Sent || st.Inflight != 0 || st.Dropped != 0 {
+		t.Fatalf("stream stats: %+v, want sent=acked=%d", st, len(full))
+	}
+	if g1.Sent+g2.Sent != st.Sent {
+		t.Fatalf("group sum %d != stream sent %d", g1.Sent+g2.Sent, st.Sent)
+	}
+	if st.Group != 2 {
+		t.Fatalf("final group=%d", st.Group)
+	}
+}
+
 func TestGroupResetAccounting(t *testing.T) {
 	c := sim.Config{LossRate: 0.2, MinDelay: time.Millisecond, MaxDelay: 8 * time.Millisecond}
 	pair := sim.NewPair(31337, c, c)
