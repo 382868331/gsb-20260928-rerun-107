@@ -10,23 +10,50 @@ func (s *Session) pumpAllLocked() {
 	if len(s.streamOrder) == 0 {
 		return
 	}
-	for range s.streamOrder {
-		if s.sendCursor >= len(s.streamOrder) {
-			s.sendCursor = 0
-		}
-		id := s.streamOrder[s.sendCursor]
-		s.sendCursor = (s.sendCursor + 1) % len(s.streamOrder)
-		if st := s.streams[id]; st != nil {
-			s.pumpStreamLocked(id, st)
+	// Weighted deficit round-robin over business groups. Heavier groups
+	// are visited first and earn a larger quantum each round, so
+	// interactive traffic goes ahead of bulk; every group still earns its
+	// weighted share per round, so a busy priority group cannot starve
+	// legitimate bulk streams.
+	quantum := uint64(s.cfg.MaxSegment)
+	for progress := true; progress; {
+		progress = false
+		for _, g := range s.orderedGroupsLocked() {
+			g.deficit += uint64(g.weight) * quantum
+			used := false
+			attempts := 0
+			for g.deficit > 0 && attempts < len(s.streamOrder) {
+				id, st := s.nextGroupStreamLocked(g)
+				if st == nil {
+					break
+				}
+				attempts++
+				n := s.pumpStreamLocked(id, st)
+				if n == 0 {
+					continue
+				}
+				used = true
+				progress = true
+				attempts = 0
+				if uint64(n) >= g.deficit {
+					g.deficit = 0
+				} else {
+					g.deficit -= uint64(n)
+				}
+			}
+			if !used {
+				g.deficit = 0 // idle groups cannot hoard future quota
+			}
 		}
 	}
 }
 
-func (s *Session) pumpStreamLocked(id uint32, st *streamState) bool {
+// pumpStreamLocked sends at most one new segment and returns its size.
+func (s *Session) pumpStreamLocked(id uint32, st *streamState) int {
 	if st.resetSent || st.peerReset || st.writeClosed {
-		return false
+		return 0
 	}
-	sent := false
+	sent := 0
 	used := st.sndNxt - st.sndUna
 	effWin := st.sndWin
 	if effWin > uint64(s.cfg.SendBuffer) {
@@ -34,22 +61,42 @@ func (s *Session) pumpStreamLocked(id uint32, st *streamState) bool {
 	}
 	if used < effWin && len(st.queued) > 0 {
 		avail := effWin - used
+		if s.totalQuota > 0 {
+			if s.inFlight >= s.totalQuota {
+				avail = 0
+			} else if left := s.totalQuota - s.inFlight; avail > left {
+				avail = left
+			}
+		}
 		n := s.cfg.MaxSegment
-		if n > len(st.queued) {
-			n = len(st.queued)
+		ch := &st.queued[0]
+		if n > len(ch.data) {
+			n = len(ch.data)
 		}
 		if uint64(n) > avail {
 			n = int(avail)
 		}
-		data := make([]byte, n)
-		copy(data, st.queued[:n])
-		st.queued = st.queued[n:]
-		seg := &outSeg{seq: st.sndNxt, data: data, sentAt: time.Now()}
-		st.segments[seg.seq] = seg
-		st.sndNxt += uint64(n)
-		s.sendLocked(Frame{Kind: KindData, Stream: id, Seq: seg.seq, Payload: data})
-		st.timerDead = time.Now().Add(s.cfg.RTO)
-		sent = true
+		if n > 0 {
+			data := make([]byte, n)
+			copy(data, ch.data[:n])
+			if n == len(ch.data) {
+				st.queued = st.queued[1:]
+			} else {
+				ch.data = ch.data[n:]
+			}
+			seg := &outSeg{seq: st.sndNxt, group: ch.group, data: data, sentAt: time.Now()}
+			st.segments[seg.seq] = seg
+			st.sndNxt += uint64(n)
+			s.sendLocked(Frame{Kind: KindData, Stream: id, Seq: seg.seq, Payload: data})
+			st.timerDead = time.Now().Add(s.cfg.RTO)
+			g := s.groupLocked(seg.group)
+			g.sent += uint64(n)
+			g.pend += uint64(n)
+			s.inFlight += uint64(n)
+			st.statSent += uint64(n)
+			st.statPend += uint64(n)
+			sent = n
+		}
 	}
 	if st.finQueued && !st.finSent && len(st.queued) == 0 && len(st.segments) == 0 &&
 		(st.sndNxt-st.sndUna == 0) {
@@ -88,6 +135,14 @@ func (s *Session) onRTO() {
 	defer s.mu.Unlock()
 	now := time.Now()
 	for id, st := range s.streams {
+		if st.resetSent && !st.peerReset {
+			// RST is not acked; repeat it until the peer's state catches
+			// up or the session winds down, so a lost cancel cannot
+			// strand the peer's readers.
+			s.sendLocked(Frame{Kind: KindRst, Stream: id})
+			st.timerDead = now.Add(s.cfg.RTO)
+			continue
+		}
 		if st.peerFin && len(st.segments) == 0 && len(st.queued) == 0 && st.localAcked && !st.finSent && !st.resetSent {
 			s.sendLocked(Frame{Kind: KindFinAck, Stream: id, Ack: st.rcvNxt, Window: s.availWindowLocked(id)})
 			st.finAckDead = now.Add(s.cfg.RTO)
@@ -135,6 +190,11 @@ func (s *Session) advanceAckLocked(f Frame) {
 		st.sndUna = f.Ack
 		for seq, seg := range st.segments {
 			if seq+uint64(len(seg.data)) <= st.sndUna {
+				n := uint64(len(seg.data))
+				g := s.groupLocked(seg.group)
+				g.pend -= n
+				s.inFlight -= n
+				st.statPend -= n
 				delete(st.segments, seq)
 			}
 		}
@@ -197,8 +257,7 @@ func (s *Session) onRst(f Frame) {
 		return
 	}
 	st.peerReset = true
-	st.queued = nil
-	st.segments = make(map[uint64]*outSeg)
+	s.discardStreamSendLocked(st)
 	s.maybeFinishLocked()
 	s.kick()
 }
@@ -253,7 +312,15 @@ func (s *Session) writeStream(id uint32, p []byte) (int, error) {
 		if uint64(n) > space {
 			n = int(space)
 		}
-		st.queued = append(st.queued, p[:n]...)
+		// Attribute queued bytes to the stream's CURRENT group; later
+		// group switches only affect subsequent chunks.
+		data := make([]byte, n)
+		copy(data, p[:n])
+		if m := len(st.queued); m > 0 && st.queued[m-1].group == st.group {
+			st.queued[m-1].data = append(st.queued[m-1].data, data...)
+		} else {
+			st.queued = append(st.queued, qChunk{group: st.group, data: data})
+		}
 		s.pumpAllLocked()
 		s.mu.Unlock()
 		p = p[n:]
@@ -362,8 +429,8 @@ func (s *Session) resetStream(id uint32, err error) error {
 	if st != nil && !st.resetSent && !st.peerReset {
 		st.resetSent = true
 		st.localAcked = true
-		st.queued = nil
-		st.segments = make(map[uint64]*outSeg)
+		s.discardStreamSendLocked(st)
+		st.timerDead = time.Now().Add(s.cfg.RTO)
 		s.sendLocked(Frame{Kind: KindRst, Stream: id})
 		s.kick()
 	}

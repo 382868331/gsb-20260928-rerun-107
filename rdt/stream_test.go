@@ -125,27 +125,50 @@ func TestStreamResetDoesNotBlockOtherStream(t *testing.T) {
 			result <- err
 			return
 		}
-		canceled, err := srv.AcceptStream()
+		// Loss and reordering decide which stream is accepted first, so
+		// identify them by behavior: one is reset, the other delivers.
+		s1, err := srv.AcceptStream()
 		if err != nil {
 			result <- err
 			return
 		}
-		good, err := srv.AcceptStream()
+		s2, err := srv.AcceptStream()
 		if err != nil {
 			result <- err
 			return
 		}
-		buf := make([]byte, 16)
-		if _, err := canceled.Read(buf); err != rdt.ErrClosed {
-			result <- err
+		type readRes struct {
+			data []byte
+			err  error
+		}
+		readOne := func(st *rdt.Stream) readRes {
+			var buf bytes.Buffer
+			tmp := make([]byte, 64)
+			for {
+				n, err := st.Read(tmp)
+				buf.Write(tmp[:n])
+				if err != nil {
+					return readRes{buf.Bytes(), err}
+				}
+			}
+		}
+		r1ch := make(chan readRes, 1)
+		go func() { r1ch <- readOne(s1) }()
+		r2 := readOne(s2)
+		r1 := <-r1ch
+		reset, delivered := r1, r2
+		if r2.err == rdt.ErrClosed {
+			reset, delivered = r2, r1
+		}
+		if reset.err != rdt.ErrClosed {
+			result <- io.ErrUnexpectedEOF
 			return
 		}
-		got, err := io.ReadAll(good)
-		if err != nil {
-			result <- err
+		if delivered.err != io.EOF {
+			result <- delivered.err
 			return
 		}
-		result <- bytesCompare(got, makePayload(5000))
+		result <- bytesCompare(delivered.data, makePayload(5000))
 	}()
 	cli, err := rdt.Dial(context.Background(), pair.A, cfg)
 	if err != nil {

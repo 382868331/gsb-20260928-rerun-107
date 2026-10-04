@@ -60,6 +60,7 @@ func (s *Session) abort() {
 	s.closed = true
 	s.recvErr = ErrClosed
 	for _, st := range s.streams {
+		s.discardStreamSendLocked(st)
 		st.peerReset = true
 	}
 	close(s.done)

@@ -40,11 +40,14 @@ type Session struct {
 
 	streams       map[uint32]*streamState
 	streamOrder   []uint32
-	sendCursor    int
 	nextLocalID   uint32
 	maxStreams    int
 	remoteStreams int
 	acceptedCh    chan *Stream
+
+	groups     map[uint32]*groupState
+	totalQuota uint64
+	inFlight   uint64
 
 	rxFrames chan Frame
 	txFrames chan Frame
@@ -56,6 +59,7 @@ type Session struct {
 
 type outSeg struct {
 	seq    uint64
+	group  uint32
 	data   []byte
 	sentAt time.Time
 }
@@ -109,6 +113,7 @@ func newSession(conn Transport, cfg Config, _ bool, epoch uint64) (*Session, err
 		cfg:        cfg.withDefaults(),
 		epoch:      epoch,
 		streams:    make(map[uint32]*streamState),
+		groups:     make(map[uint32]*groupState),
 		acceptedCh: make(chan *Stream, 128),
 		rxFrames:   make(chan Frame, 256),
 		txFrames:   make(chan Frame, 4096),
@@ -123,6 +128,8 @@ func newSession(conn Transport, cfg Config, _ bool, epoch uint64) (*Session, err
 	s.streams[defaultStreamID] = newStreamState(defaultStreamID, 0)
 	s.streamOrder = append(s.streamOrder, defaultStreamID)
 	s.nextLocalID = 1
+	s.groupLocked(0)
+	s.totalQuota = uint64(s.cfg.GroupQuota)
 	s.cond = sync.NewCond(&s.mu)
 	s.wg.Add(1)
 	go s.readLoop()

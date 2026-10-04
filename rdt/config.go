@@ -12,6 +12,9 @@ type Config struct {
 	RecvBuffer int
 	// MaxStreams bounds how many remotely initiated streams may exist at once.
 	MaxStreams int
+	// GroupQuota bounds connection-wide unacknowledged bytes shared by all
+	// business groups. Defaults to SendBuffer.
+	GroupQuota int
 	// HandshakeTimeout bounds a single handshake step retransmission wait.
 	HandshakeTimeout time.Duration
 	// RTO is the retransmission timeout for data and FIN segments.
@@ -35,6 +38,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.RecvBuffer < c.MaxSegment {
 		c.RecvBuffer = c.MaxSegment
+	}
+	if c.GroupQuota <= 0 {
+		c.GroupQuota = c.SendBuffer
 	}
 	if c.HandshakeTimeout <= 0 {
 		c.HandshakeTimeout = 250 * time.Millisecond

@@ -7,13 +7,14 @@ import (
 )
 
 type streamState struct {
-	id uint32
+	id    uint32
+	group uint32
 
 	sndUna        uint64
 	sndNxt        uint64
 	sndWin        uint64
 	segments      map[uint64]*outSeg
-	queued        []byte
+	queued        []qChunk
 	finQueued     bool
 	finSent       bool
 	localAcked    bool
@@ -35,6 +36,10 @@ type streamState struct {
 	finAckDead time.Time
 	finAcked   chan struct{}
 	peerDone   chan struct{}
+
+	statSent uint64
+	statPend uint64
+	statDrop uint64
 }
 
 func newStreamState(id uint32, initialWindow uint64) *streamState {
@@ -48,7 +53,10 @@ func newStreamState(id uint32, initialWindow uint64) *streamState {
 }
 
 func (st *streamState) outstanding() uint64 {
-	n := uint64(len(st.queued))
+	n := uint64(0)
+	for _, ch := range st.queued {
+		n += uint64(len(ch.data))
+	}
 	for _, seg := range st.segments {
 		n += uint64(len(seg.data))
 	}
@@ -89,6 +97,17 @@ func (st *Stream) CloseWrite(ctx context.Context) error {
 // Close abandons this stream only. Other streams remain usable.
 func (st *Stream) Close() error {
 	return st.s.resetStream(st.id, ErrClosed)
+}
+
+// SetGroup moves this stream to a business group for FUTURE writes only.
+// Bytes already queued or in flight stay attributed to the group they
+// were sent under, so switching groups cannot free or duplicate quota.
+func (st *Stream) SetGroup(group uint32) { st.s.setStreamGroup(st.id, group) }
+
+// Stats returns this stream's send accounting snapshot.
+func (st *Stream) Stats() StreamStats {
+	s, _ := st.s.StreamStats(st.id)
+	return s
 }
 
 var _ io.Reader = (*Stream)(nil)

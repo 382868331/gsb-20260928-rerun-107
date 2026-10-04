@@ -43,6 +43,7 @@ func (s *Session) failTransport(err error) {
 	s.closed = true
 	s.recvErr = err
 	for _, st := range s.streams {
+		s.discardStreamSendLocked(st)
 		st.peerReset = true
 	}
 	s.kick()

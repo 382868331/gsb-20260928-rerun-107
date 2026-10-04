@@ -12,8 +12,9 @@
   - `handshake.go`：带 epoch 的会话建立与握手重传。
   - `loop.go`：单一事件循环，处理收包与定时重传。
   - `send.go`：发送窗口、累积 ACK、RTO 重传、零窗口探测、接收缓存、按序交付、`Read`/`Write`。
-  - `stream.go`：独立流状态、流级 RST 取消与每流读写 API。
-  - `close.go`：默认流 FIN/FINACK 半关闭、连接级 Abort、被动端静默宽限。
+- `stream.go`：独立流状态、流级 RST 取消与每流读写 API。
+- `group.go`：业务组共享额度、加权 DRR 调度、运行中调整与按组/按流核对。
+- `close.go`：默认流 FIN/FINACK 半关闭、连接级 Abort、被动端静默宽限。
 - `sim/`：可重放的丢包/延迟/重复模拟链路 `sim.NewPair(seed, ab, ba)`，
   `Link.Decisions()` 记录每帧故障决策，便于精确重放。
 
@@ -30,6 +31,17 @@
 - **独立多路复用流**：`OpenStream`/`AcceptStream` 得到独立 `Stream`，各流有独立
   序号、ACK、FIN、RST 和有界接收/发送缓存；发送器按流轮询，慢读或取消一条流
   不会堵死其他正常流，也不会让慢流数据无限缓存。
+- **业务组共享额度**：连接内流按业务组（`Stream.SetGroup`/`Session.SetGroup`）
+  共享总额度（`Config.GroupQuota`，默认 `SendBuffer`）。组间按权重做亏空轮询
+  （DRR）调度：交互组（高权重）优先且份额更大，但每组每轮都保有其权重份额，
+  优先组持续繁忙也不会饿死批量组。`SetGroupWeight`/`SetTotalQuota` 可在传输
+  进行中调整；在途字节继续计入占用，调低额度只是暂停新发送直到在途排空，
+  接收窗口上限不变，慢接收者的积压不会因此突破 `RecvBuffer`。
+- **换组不转移占用**：`SetGroup` 只影响之后的写入；已排队/在途字节按发送时
+  的组归属，确认与取消（RST/Abort）释放的占用也记回原组，反复换组不能
+  套取额外额度。`Session.GroupStats`/`StreamStats`（`Stream.Stats`）提供按组
+  和按流的已发送、待确认、已丢弃字节核对；配合 `sim.Link.Decisions()` 可
+  重放同一故障过程，解释公平等待与最终 FIN 收尾。
 - **半关闭与取消**：`Close`/`CloseWrite` 只结束发送方向，仍可读取对向尚未完成的数据；
   `Stream.Close` 仅 RST 当前流，`Session.Abort` 或取消等待才终止整个连接。
 - **故障全程开启**：测试在整个传输过程中保持丢包/延迟，从不通过“关闭故障”
@@ -70,5 +82,10 @@ go test ./... -race     # 竞态
 - `TestNoDuplicateDelivery`：45% 丢包下无重复/乱序交付。
 - `TestIndependentStreamsFairAndBounded`：小缓存下慢流不阻塞正常流。
 - `TestStreamResetDoesNotBlockOtherStream`：单流 RST 不影响其他流。
+- `TestGroupSharedQuotaFairProgress`：交互/批量组共享小额度，批量组不被饿死。
+- `TestGroupSwitchAccounting`：连续换组后按组/按流核对发送、待确认、丢弃。
+- `TestGroupResetAccounting`：换组后取消，占用与丢弃仍记回原组。
+- `TestRuntimeQuotaAndWeightAdjust`：传输中调整组权重与总额度仍完整交付。
+- `TestGroupHalfCloseReplay`：换组 + 双向半关闭逐字节核对，同种子重放故障决策。
 - `TestHalfCloseKeepsReceiving`：半关闭后继续接收对向数据。
 - `TestDeterministicDuplicatesRecorded`：重复包下字节正确，故障决策可读取。
