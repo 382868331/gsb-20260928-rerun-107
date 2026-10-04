@@ -448,3 +448,151 @@ func TestGroupHalfCloseReplayable(t *testing.T) {
 		t.Fatalf("decisions incomplete: data=%v lost=%v fin=%v finack=%v", data, lost, fin, finAck)
 	}
 }
+
+// TestGroupSwitchPinsQueuedBytes reproduces the misattribution where
+// bytes written under an old group but still queued (small segments,
+// tight quota) were charged to the new group after a switch. The group
+// of every fragment is pinned at Write time and must survive splitting,
+// retransmission, acknowledgement and cancellation; the per-group and
+// per-stream sent/inflight/dropped ledgers must reconcile after a
+// runtime quota shrink and a half-close.
+func TestGroupSwitchPinsQueuedBytes(t *testing.T) {
+	c := sim.Config{LossRate: 0.2, MinDelay: 20 * time.Millisecond, MaxDelay: 40 * time.Millisecond}
+	pair := sim.NewPair(60221, c, c)
+	cfg := rdt.Config{
+		MaxSegment:       2, // tiny segments force splitting
+		SendBuffer:       32,
+		RecvBuffer:       32,
+		GroupQuota:       4, // tight: 6-byte write leaves 2 bytes queued
+		HandshakeTimeout: 50 * time.Millisecond,
+		RTO:              60 * time.Millisecond,
+	}
+
+	oldGroup := makePayload(6)
+	newGroup := makePayload(10)
+	canceled := makePayload(40)
+	srvErr := make(chan error, 1)
+	go func() {
+		srv, err := rdt.Accept(context.Background(), pair.B, cfg)
+		if err != nil {
+			srvErr <- err
+			return
+		}
+		resetSt, err := srv.AcceptStream()
+		if err != nil {
+			srvErr <- err
+			return
+		}
+		readDone := make(chan error, 1)
+		go func() {
+			buf := make([]byte, 8)
+			for {
+				if _, err := resetSt.Read(buf); err == rdt.ErrClosed {
+					readDone <- nil
+					return
+				} else if err != nil {
+					readDone <- err
+					return
+				}
+			}
+		}()
+		var got bytes.Buffer
+		_, _ = io.CopyBuffer(&got, srv, make([]byte, 5))
+		want := append(append([]byte{}, oldGroup...), newGroup...)
+		if !bytes.Equal(got.Bytes(), want) {
+			srvErr <- io.ErrShortBuffer
+			return
+		}
+		if err := <-readDone; err != nil {
+			srvErr <- err
+			return
+		}
+		srvErr <- nil
+	}()
+
+	cli, err := rdt.Dial(context.Background(), pair.A, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Six bytes under the default group 0: 4 go in flight (quota), 2 stay
+	// queued. The one-way delay exceeds the switch latency, so the queued
+	// bytes are still unsent when the stream changes group.
+	if _, err := cli.Write(oldGroup); err != nil {
+		t.Fatal(err)
+	}
+	if err := cli.SetStreamGroup(0, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cli.Write(newGroup); err != nil {
+		t.Fatal(err)
+	}
+	// Shrink the quota below the in-flight level: occupancy stays charged
+	// to the pinned groups and only new sends pause.
+	cli.SetTotalQuota(2)
+	time.Sleep(80 * time.Millisecond)
+	g0 := cli.GroupStats(0)
+	if g0.Sent != g0.Acked+g0.Inflight+g0.Dropped {
+		t.Fatalf("group 0 ledger unbalanced after shrink: %+v", g0)
+	}
+	if g0.Sent > uint64(len(oldGroup)) {
+		t.Fatalf("group 0 overcharged: %+v", g0)
+	}
+	cli.SetTotalQuota(64)
+
+	// A second stream canceled after the switch: its dropped bytes must
+	// land on its own group without disturbing groups 0 and 1.
+	resetSt := cli.OpenStream()
+	resetSt.SetGroup(2)
+	resetDone := make(chan error, 1)
+	go func() { _, err := resetSt.Write(canceled); resetDone <- err }()
+	time.Sleep(50 * time.Millisecond)
+	if err := resetSt.Close(); err != nil {
+		t.Fatal(err)
+	}
+	<-resetDone
+
+	if err := cli.CloseWrite(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	waitStreamInflightZero(t, cli, 0)
+	select {
+	case err := <-srvErr:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("server did not finish")
+	}
+
+	// The 6 old-group bytes (including the 2 queued across the switch)
+	// belong to group 0; only the post-switch write belongs to group 1.
+	g0 = cli.GroupStats(0)
+	if g0.Sent != uint64(len(oldGroup)) || g0.Acked != g0.Sent || g0.Inflight != 0 || g0.Dropped != 0 {
+		t.Fatalf("group 0 final: %+v want sent=acked=%d", g0, len(oldGroup))
+	}
+	g1 := cli.GroupStats(1)
+	if g1.Sent != uint64(len(newGroup)) || g1.Acked != g1.Sent || g1.Inflight != 0 || g1.Dropped != 0 {
+		t.Fatalf("group 1 final: %+v want sent=acked=%d", g1, len(newGroup))
+	}
+	g2 := cli.GroupStats(2)
+	if g2.Dropped == 0 || g2.Inflight != 0 || g2.Sent != g2.Acked+g2.Dropped {
+		t.Fatalf("group 2 final: %+v", g2)
+	}
+	st, ok := cli.StreamStats(0)
+	if !ok {
+		t.Fatal("stream stats missing")
+	}
+	if st.Sent != uint64(len(oldGroup)+len(newGroup)) || st.Acked != st.Sent || st.Inflight != 0 {
+		t.Fatalf("stream 0 final: %+v", st)
+	}
+	if g0.Sent+g1.Sent != st.Sent {
+		t.Fatalf("group/stream sent mismatch: %d+%d != %d", g0.Sent, g1.Sent, st.Sent)
+	}
+	rst, _ := cli.StreamStats(resetSt.ID())
+	if rst.Dropped == 0 || rst.Dropped != g2.Dropped {
+		t.Fatalf("reset stream dropped=%d group dropped=%d", rst.Dropped, g2.Dropped)
+	}
+	if err := cli.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}

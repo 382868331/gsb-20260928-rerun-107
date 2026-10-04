@@ -39,10 +39,10 @@ func (s *Session) sendGroupSegmentLocked(g *groupState) int {
 		if g.cursor >= n {
 			g.cursor = 0
 		}
-		id := s.streamOrder[g.cursor]
+	id := s.streamOrder[g.cursor]
 		g.cursor = (g.cursor + 1) % n
 		st := s.streams[id]
-		if st == nil || st.group != g.id {
+		if st == nil || st.sendGroupLocked() != g.id {
 			continue
 		}
 		if sent := s.sendSegmentLocked(id, st); sent > 0 {
@@ -66,15 +66,16 @@ func (s *Session) sendSegmentLocked(id uint32, st *streamState) int {
 	if used >= effWin || len(st.queued) == 0 {
 		return 0
 	}
+	head := &st.queued[0]
 	avail := effWin - used
 	n := s.cfg.MaxSegment
-	if n > len(st.queued) {
-		n = len(st.queued)
+	if n > len(head.data) {
+		n = len(head.data)
 	}
 	if uint64(n) > avail {
 		n = int(avail)
 	}
-	room := s.quotaRoomLocked(s.groupLocked(st.group))
+	room := s.quotaRoomLocked(s.groupLocked(head.group))
 	if room <= 0 {
 		return 0
 	}
@@ -82,9 +83,12 @@ func (s *Session) sendSegmentLocked(id uint32, st *streamState) int {
 		n = int(room)
 	}
 	data := make([]byte, n)
-	copy(data, st.queued[:n])
-	st.queued = st.queued[n:]
-	seg := &outSeg{seq: st.sndNxt, data: data, sentAt: time.Now()}
+	copy(data, head.data[:n])
+	head.data = head.data[n:]
+	if len(head.data) == 0 {
+		st.queued = st.queued[1:]
+	}
+	seg := &outSeg{seq: st.sndNxt, data: data, sentAt: time.Now(), group: head.group}
 	st.segments[seg.seq] = seg
 	st.sndNxt += uint64(n)
 	s.chargeSendLocked(st, seg)
@@ -308,7 +312,11 @@ func (s *Session) writeStream(id uint32, p []byte) (int, error) {
 		if uint64(n) > space {
 			n = int(space)
 		}
-		st.queued = append(st.queued, p[:n]...)
+		if last := len(st.queued) - 1; last >= 0 && st.queued[last].group == st.group {
+			st.queued[last].data = append(st.queued[last].data, p[:n]...)
+		} else {
+			st.queued = append(st.queued, queuedChunk{group: st.group, data: append([]byte(nil), p[:n]...)})
+		}
 		s.pumpAllLocked()
 		s.mu.Unlock()
 		p = p[n:]

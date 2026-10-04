@@ -16,7 +16,7 @@ type streamState struct {
 	sndNxt        uint64
 	sndWin        uint64
 	segments      map[uint64]*outSeg
-	queued        []byte
+	queued        []queuedChunk
 	finQueued     bool
 	finSent       bool
 	localAcked    bool
@@ -40,6 +40,15 @@ type streamState struct {
 	peerDone   chan struct{}
 }
 
+// queuedChunk is a run of written bytes pinned to the business group the
+// stream belonged to when they were queued. Later group switches only
+// append new chunks; earlier bytes keep their original attribution
+// through segmentation, retransmission, acknowledgement and cancel.
+type queuedChunk struct {
+	group uint32
+	data  []byte
+}
+
 func newStreamState(id uint32, initialWindow uint64) *streamState {
 	return &streamState{
 		id:       id,
@@ -51,7 +60,10 @@ func newStreamState(id uint32, initialWindow uint64) *streamState {
 }
 
 func (st *streamState) outstanding() uint64 {
-	n := uint64(len(st.queued))
+	var n uint64
+	for _, c := range st.queued {
+		n += uint64(len(c.data))
+	}
 	for _, seg := range st.segments {
 		n += uint64(len(seg.data))
 	}
@@ -60,6 +72,16 @@ func (st *streamState) outstanding() uint64 {
 
 func (st *streamState) closedForIO() bool {
 	return st.peerReset || st.resetSent || st.writeClosed
+}
+
+// sendGroupLocked is the group the next transmitted segment is charged
+// to: the group pinned to the oldest queued bytes, or the stream's
+// current group when nothing is queued.
+func (st *streamState) sendGroupLocked() uint32 {
+	if len(st.queued) > 0 {
+		return st.queued[0].group
+	}
+	return st.group
 }
 
 // Stream is one independent bidirectional byte stream multiplexed on a Session.
@@ -71,9 +93,9 @@ type Stream struct {
 // ID returns the stream's connection-unique identifier.
 func (st *Stream) ID() uint32 { return st.id }
 
-// SetGroup moves the stream to a business group. Only sends made after
+// SetGroup moves the stream to a business group. Only writes made after
 // the switch are charged to the new group; earlier occupancy,
-// acknowledgements and cancellation stay with the group that sent them.
+// acknowledgements and cancellation stay with the group that queued them.
 func (st *Stream) SetGroup(g uint32) { _ = st.s.SetStreamGroup(st.id, g) }
 
 // Group returns the stream's current business group.

@@ -122,10 +122,10 @@ func (s *Session) TotalQuota() uint64 {
 	return s.totalQuota
 }
 
-// SetStreamGroup moves a stream to a business group. Only segments sent
+// SetStreamGroup moves a stream to a business group. Only bytes written
 // after the switch are charged to the new group; occupancy,
-// acknowledgements and cancellation of earlier sends remain with the
-// group they were sent under.
+// acknowledgements and cancellation of earlier writes remain with the
+// group they were queued under.
 func (s *Session) SetStreamGroup(streamID uint32, group uint32) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -173,11 +173,10 @@ func (s *Session) StreamStats(id uint32) (StreamStats, bool) {
 	}, true
 }
 
-// chargeSendLocked meters a first-time data transmission to the group the
-// stream currently belongs to.
+// chargeSendLocked meters a first-time data transmission to the group
+// pinned to the segment when its bytes were written.
 func (s *Session) chargeSendLocked(st *streamState, seg *outSeg) {
-	g := s.groupLocked(st.group)
-	seg.group = st.group
+	g := s.groupLocked(seg.group)
 	n := uint64(len(seg.data))
 	g.inflight += n
 	g.sent += n
@@ -208,6 +207,10 @@ func (s *Session) dropStreamLocked(st *streamState) {
 		st.statDropped += n
 	}
 	st.segments = make(map[uint64]*outSeg)
-	st.statDropped += uint64(len(st.queued))
+	for _, c := range st.queued {
+		g := s.groupLocked(c.group)
+		g.dropped += uint64(len(c.data))
+		st.statDropped += uint64(len(c.data))
+	}
 	st.queued = nil
 }
