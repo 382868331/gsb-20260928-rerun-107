@@ -10,46 +10,93 @@ func (s *Session) pumpAllLocked() {
 	if len(s.streamOrder) == 0 {
 		return
 	}
-	for range s.streamOrder {
-		if s.sendCursor >= len(s.streamOrder) {
-			s.sendCursor = 0
+	for {
+		progress := false
+		for range s.groupOrder {
+			if s.groupCursor >= len(s.groupOrder) {
+				s.groupCursor = 0
+			}
+			g := s.groups[s.groupOrder[s.groupCursor]]
+			s.groupCursor = (s.groupCursor + 1) % len(s.groupOrder)
+			for s.sendGroupSegmentLocked(g) > 0 {
+				progress = true
+			}
 		}
-		id := s.streamOrder[s.sendCursor]
-		s.sendCursor = (s.sendCursor + 1) % len(s.streamOrder)
-		if st := s.streams[id]; st != nil {
-			s.pumpStreamLocked(id, st)
+		if !progress {
+			break
 		}
+	}
+	for id, st := range s.streams {
+		s.pumpFinLocked(id, st)
 	}
 }
 
-func (s *Session) pumpStreamLocked(id uint32, st *streamState) bool {
-	if st.resetSent || st.peerReset || st.writeClosed {
-		return false
+// sendGroupSegmentLocked transmits one new data segment for the next
+// sendable stream of the group, returning the bytes put in flight.
+func (s *Session) sendGroupSegmentLocked(g *groupState) int {
+	n := len(s.streamOrder)
+	for i := 0; i < n; i++ {
+		if g.cursor >= n {
+			g.cursor = 0
+		}
+		id := s.streamOrder[g.cursor]
+		g.cursor = (g.cursor + 1) % n
+		st := s.streams[id]
+		if st == nil || st.group != g.id {
+			continue
+		}
+		if sent := s.sendSegmentLocked(id, st); sent > 0 {
+			return sent
+		}
 	}
-	sent := false
+	return 0
+}
+
+// sendSegmentLocked transmits at most one new data segment, bounded by
+// the stream window, the send buffer and the group's quota room.
+func (s *Session) sendSegmentLocked(id uint32, st *streamState) int {
+	if st.resetSent || st.peerReset || st.writeClosed {
+		return 0
+	}
 	used := st.sndNxt - st.sndUna
 	effWin := st.sndWin
 	if effWin > uint64(s.cfg.SendBuffer) {
 		effWin = uint64(s.cfg.SendBuffer)
 	}
-	if used < effWin && len(st.queued) > 0 {
-		avail := effWin - used
-		n := s.cfg.MaxSegment
-		if n > len(st.queued) {
-			n = len(st.queued)
-		}
-		if uint64(n) > avail {
-			n = int(avail)
-		}
-		data := make([]byte, n)
-		copy(data, st.queued[:n])
-		st.queued = st.queued[n:]
-		seg := &outSeg{seq: st.sndNxt, data: data, sentAt: time.Now()}
-		st.segments[seg.seq] = seg
-		st.sndNxt += uint64(n)
-		s.sendLocked(Frame{Kind: KindData, Stream: id, Seq: seg.seq, Payload: data})
-		st.timerDead = time.Now().Add(s.cfg.RTO)
-		sent = true
+	if used >= effWin || len(st.queued) == 0 {
+		return 0
+	}
+	avail := effWin - used
+	n := s.cfg.MaxSegment
+	if n > len(st.queued) {
+		n = len(st.queued)
+	}
+	if uint64(n) > avail {
+		n = int(avail)
+	}
+	room := s.quotaRoomLocked(s.groupLocked(st.group))
+	if room <= 0 {
+		return 0
+	}
+	if int64(n) > room {
+		n = int(room)
+	}
+	data := make([]byte, n)
+	copy(data, st.queued[:n])
+	st.queued = st.queued[n:]
+	seg := &outSeg{seq: st.sndNxt, data: data, sentAt: time.Now()}
+	st.segments[seg.seq] = seg
+	st.sndNxt += uint64(n)
+	s.chargeSendLocked(st, seg)
+	s.sendLocked(Frame{Kind: KindData, Stream: id, Seq: seg.seq, Payload: data})
+	st.timerDead = time.Now().Add(s.cfg.RTO)
+	return n
+}
+
+// pumpFinLocked sends a due FIN; control frames are not quota-limited.
+func (s *Session) pumpFinLocked(id uint32, st *streamState) {
+	if st.resetSent || st.peerReset || st.writeClosed {
+		return
 	}
 	if st.finQueued && !st.finSent && len(st.queued) == 0 && len(st.segments) == 0 &&
 		(st.sndNxt-st.sndUna == 0) {
@@ -57,7 +104,6 @@ func (s *Session) pumpStreamLocked(id uint32, st *streamState) bool {
 		s.sendLocked(Frame{Kind: KindFin, Stream: id, Seq: st.sndNxt, Ack: st.rcvNxt, Window: s.availWindowLocked(id)})
 		st.timerDead = time.Now().Add(s.cfg.RTO)
 	}
-	return sent
 }
 
 func (s *Session) maybeRTO() {
@@ -88,6 +134,15 @@ func (s *Session) onRTO() {
 	defer s.mu.Unlock()
 	now := time.Now()
 	for id, st := range s.streams {
+		if st.resetSent {
+			// RST rides the unreliable channel too; retransmit it so a
+			// lost reset cannot leave the peer's stream stuck forever.
+			if !st.peerReset {
+				s.sendLocked(Frame{Kind: KindRst, Stream: id})
+			}
+			st.timerDead = now.Add(s.cfg.RTO)
+			continue
+		}
 		if st.peerFin && len(st.segments) == 0 && len(st.queued) == 0 && st.localAcked && !st.finSent && !st.resetSent {
 			s.sendLocked(Frame{Kind: KindFinAck, Stream: id, Ack: st.rcvNxt, Window: s.availWindowLocked(id)})
 			st.finAckDead = now.Add(s.cfg.RTO)
@@ -135,6 +190,7 @@ func (s *Session) advanceAckLocked(f Frame) {
 		st.sndUna = f.Ack
 		for seq, seg := range st.segments {
 			if seq+uint64(len(seg.data)) <= st.sndUna {
+				s.releaseSegLocked(st, seg)
 				delete(st.segments, seq)
 			}
 		}
@@ -197,8 +253,7 @@ func (s *Session) onRst(f Frame) {
 		return
 	}
 	st.peerReset = true
-	st.queued = nil
-	st.segments = make(map[uint64]*outSeg)
+	s.dropStreamLocked(st)
 	s.maybeFinishLocked()
 	s.kick()
 }
@@ -362,9 +417,9 @@ func (s *Session) resetStream(id uint32, err error) error {
 	if st != nil && !st.resetSent && !st.peerReset {
 		st.resetSent = true
 		st.localAcked = true
-		st.queued = nil
-		st.segments = make(map[uint64]*outSeg)
+		s.dropStreamLocked(st)
 		s.sendLocked(Frame{Kind: KindRst, Stream: id})
+		st.timerDead = time.Now().Add(s.cfg.RTO)
 		s.kick()
 	}
 	s.mu.Unlock()

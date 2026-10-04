@@ -136,9 +136,16 @@ func TestStreamResetDoesNotBlockOtherStream(t *testing.T) {
 			return
 		}
 		buf := make([]byte, 16)
-		if _, err := canceled.Read(buf); err != rdt.ErrClosed {
-			result <- err
-			return
+		// Data already delivered before the reset must still be drained;
+		// the stream only reports ErrClosed once the RST arrives (the RST
+		// itself may be lost and retransmitted on the unreliable link).
+		for {
+			if _, err := canceled.Read(buf); err == rdt.ErrClosed {
+				break
+			} else if err != nil {
+				result <- err
+				return
+			}
 		}
 		got, err := io.ReadAll(good)
 		if err != nil {

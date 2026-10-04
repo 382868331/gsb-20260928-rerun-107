@@ -9,6 +9,9 @@ import (
 type streamState struct {
 	id uint32
 
+	group                            uint32
+	statSent, statAcked, statDropped uint64
+
 	sndUna        uint64
 	sndNxt        uint64
 	sndWin        uint64
@@ -67,6 +70,21 @@ type Stream struct {
 
 // ID returns the stream's connection-unique identifier.
 func (st *Stream) ID() uint32 { return st.id }
+
+// SetGroup moves the stream to a business group. Only sends made after
+// the switch are charged to the new group; earlier occupancy,
+// acknowledgements and cancellation stay with the group that sent them.
+func (st *Stream) SetGroup(g uint32) { _ = st.s.SetStreamGroup(st.id, g) }
+
+// Group returns the stream's current business group.
+func (st *Stream) Group() uint32 {
+	st.s.mu.Lock()
+	defer st.s.mu.Unlock()
+	if st2 := st.s.streams[st.id]; st2 != nil {
+		return st2.group
+	}
+	return 0
+}
 
 // Read reads bytes from this stream. A return of io.EOF means only the
 // peer's send direction ended; the local send direction remains usable.
