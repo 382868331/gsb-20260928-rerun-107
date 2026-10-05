@@ -436,12 +436,21 @@ func TestGroupResetAccounting(t *testing.T) {
 	if gs.Dropped == 0 {
 		t.Fatalf("reset group dropped nothing: %+v", gs)
 	}
-	if gs.Sent != gs.Acked+gs.Dropped {
+	if gs.Dropped != gs.DroppedInflight+gs.DroppedQueued {
+		t.Fatalf("group 7 dropped split: %+v", gs)
+	}
+	if gs.Sent != gs.Acked+gs.DroppedInflight {
 		t.Fatalf("group 7 conservation: %+v", gs)
 	}
 	st, _ := cli.StreamStats(canceled.ID())
 	if st.Dropped == 0 {
 		t.Fatalf("stream dropped nothing: %+v", st)
+	}
+	if st.Dropped != st.DroppedInflight+st.DroppedQueued {
+		t.Fatalf("stream dropped split: %+v", st)
+	}
+	if st.Dropped != gs.Dropped {
+		t.Fatalf("stream dropped %d != group dropped %d", st.Dropped, gs.Dropped)
 	}
 }
 
@@ -540,5 +549,302 @@ func TestGroupHalfCloseReplayable(t *testing.T) {
 	}
 	if !data || !lost || !fin || !finAck {
 		t.Fatalf("decisions incomplete: data=%v lost=%v fin=%v finack=%v", data, lost, fin, finAck)
+	}
+}
+
+func waitStreamAcked(t *testing.T, s *rdt.Session, id uint32, acked uint64) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		st, ok := s.StreamStats(id)
+		if ok && st.Acked >= acked {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	st, _ := s.StreamStats(id)
+	t.Fatalf("stream %d acked did not reach %d: %+v", id, acked, st)
+}
+
+// TestGroupCancelAttributesQueuedDrops reproduces the reported ledger
+// bug: 6 bytes written under the old group, 6 more after switching, the
+// receive window caps the transfer at 4 acknowledged bytes, and the
+// stream is then reset. The stream drops 8 bytes; the old group must
+// answer for its remaining 2 queued bytes and the new group for its 6,
+// all as never-sent (queued) drops, and a repeated close must not
+// count them again.
+func TestGroupCancelAttributesQueuedDrops(t *testing.T) {
+	c := sim.Config{LossRate: 0, MinDelay: 20 * time.Millisecond, MaxDelay: 40 * time.Millisecond}
+	pair := sim.NewPair(60222, c, c)
+	cfg := groupCfg()
+	cfg.MaxSegment = 4
+	cfg.SendBuffer = 64
+	cfg.RecvBuffer = 4 // peer window closes after the first segment
+	cfg.GroupQuota = 4 // one segment in flight at a time
+
+	srvErr := make(chan error, 1)
+	go func() {
+		srv, err := rdt.Accept(context.Background(), pair.B, cfg)
+		if err != nil {
+			srvErr <- err
+			return
+		}
+		if _, err := srv.AcceptStream(); err != nil {
+			srvErr <- err
+			return
+		}
+		// Never read: the advertised window stays 0 after 4 bytes.
+		srvErr <- nil
+	}()
+
+	cli, err := rdt.Dial(context.Background(), pair.A, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Abort()
+	st := cli.OpenStream()
+	st.SetGroup(1)
+	if _, err := st.Write(makePayload(6)); err != nil { // 4 in flight, 2 queued
+		t.Fatal(err)
+	}
+	st.SetGroup(2)
+	if _, err := st.Write(makePayload(6)); err != nil { // all 6 queued
+		t.Fatal(err)
+	}
+	waitStreamAcked(t, cli, st.ID(), 4)
+	if got := cli.GroupStats(1); got.Sent != 4 || got.Acked != 4 || got.Inflight != 0 {
+		t.Fatalf("group 1 before cancel: %+v", got)
+	}
+
+	snap := func() (rdt.StreamStats, rdt.GroupStats, rdt.GroupStats) {
+		ss, _ := cli.StreamStats(st.ID())
+		return ss, cli.GroupStats(1), cli.GroupStats(2)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ss, g1, g2 := snap()
+	if ss.Sent != 4 || ss.Acked != 4 || ss.Dropped != 8 ||
+		ss.DroppedInflight != 0 || ss.DroppedQueued != 8 {
+		t.Fatalf("stream stats after cancel: %+v", ss)
+	}
+	if g1.Dropped != 2 || g1.DroppedQueued != 2 || g1.DroppedInflight != 0 ||
+		g1.Sent != 4 || g1.Acked != 4 || g1.Inflight != 0 {
+		t.Fatalf("old group stats after cancel: %+v", g1)
+	}
+	if g2.Dropped != 6 || g2.DroppedQueued != 6 || g2.DroppedInflight != 0 ||
+		g2.Sent != 0 || g2.Acked != 0 {
+		t.Fatalf("new group stats after cancel: %+v", g2)
+	}
+	if g1.Dropped+g2.Dropped != ss.Dropped {
+		t.Fatalf("group drops %d+%d != stream drops %d", g1.Dropped, g2.Dropped, ss.Dropped)
+	}
+
+	// A repeated close must not record the drop a second time.
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ss2, g1b, g2b := snap()
+	if ss2 != ss || g1b != g1 || g2b != g2 {
+		t.Fatalf("second close changed the ledger: %+v %+v %+v", ss2, g1b, g2b)
+	}
+
+	select {
+	case err := <-srvErr:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("server did not accept the stream")
+	}
+}
+
+// TestGroupCancelInflightAndQueuedSplit cancels mid-flight after several
+// group switches with different fragment splits, before any ACK arrives:
+// sent-but-unacked bytes must land in DroppedInflight and never-sent
+// bytes in DroppedQueued, each under the group that owned the fragment,
+// and the group ledgers must sum to the stream ledger.
+func TestGroupCancelInflightAndQueuedSplit(t *testing.T) {
+	c := sim.Config{LossRate: 0, MinDelay: 20 * time.Millisecond, MaxDelay: 40 * time.Millisecond}
+	pair := sim.NewPair(60223, c, c)
+	cfg := groupCfg()
+	cfg.MaxSegment = 4
+	cfg.SendBuffer = 64
+	cfg.RecvBuffer = 64
+	cfg.GroupQuota = 8 // shared by groups 0..3, weight 1 each
+
+	srvErr := make(chan error, 1)
+	go func() {
+		srv, err := rdt.Accept(context.Background(), pair.B, cfg)
+		if err != nil {
+			srvErr <- err
+			return
+		}
+		if _, err := srv.AcceptStream(); err != nil {
+			srvErr <- err
+			return
+		}
+		srvErr <- nil
+	}()
+
+	cli, err := rdt.Dial(context.Background(), pair.A, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Abort()
+	st := cli.OpenStream()
+
+	// Group 1: 8 bytes, both segments fit the quota -> 8 in flight.
+	st.SetGroup(1)
+	if _, err := st.Write(makePayload(8)); err != nil {
+		t.Fatal(err)
+	}
+	// Group 2: quota exhausted, guaranteed share 8/3 -> 2 in flight, 2 queued.
+	st.SetGroup(2)
+	if _, err := st.Write(makePayload(4)); err != nil {
+		t.Fatal(err)
+	}
+	// Group 3: its bytes sit behind group 2's queued tail in the stream's
+	// ordered queue, and group 2's guaranteed share (8/4 = 2) is already
+	// in flight, so nothing more can send -> all 6 queued.
+	st.SetGroup(3)
+	if _, err := st.Write(makePayload(6)); err != nil {
+		t.Fatal(err)
+	}
+	// Cancel before any ACK can arrive (link latency is at least 20ms).
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	wantInflight := map[uint32]uint64{1: 8, 2: 2, 3: 0}
+	wantQueued := map[uint32]uint64{1: 0, 2: 2, 3: 6}
+	var sumSent, sumDrop uint64
+	for g := uint32(1); g <= 3; g++ {
+		gs := cli.GroupStats(g)
+		if gs.DroppedInflight != wantInflight[g] || gs.DroppedQueued != wantQueued[g] {
+			t.Fatalf("group %d drops: %+v want inflight=%d queued=%d",
+				g, gs, wantInflight[g], wantQueued[g])
+		}
+		if gs.Dropped != gs.DroppedInflight+gs.DroppedQueued {
+			t.Fatalf("group %d dropped split: %+v", g, gs)
+		}
+		if gs.Sent != gs.Acked+gs.Inflight+gs.DroppedInflight {
+			t.Fatalf("group %d ledger unbalanced: %+v", g, gs)
+		}
+		if gs.Inflight != 0 || gs.Acked != 0 {
+			t.Fatalf("group %d settled bytes after cancel: %+v", g, gs)
+		}
+		sumSent += gs.Sent
+		sumDrop += gs.Dropped
+	}
+	ss, ok := cli.StreamStats(st.ID())
+	if !ok {
+		t.Fatal("stream stats missing")
+	}
+	if ss.Sent != 10 || ss.DroppedInflight != 10 || ss.DroppedQueued != 8 || ss.Dropped != 18 {
+		t.Fatalf("stream stats after cancel: %+v", ss)
+	}
+	if sumSent != ss.Sent || sumDrop != ss.Dropped {
+		t.Fatalf("group sums sent=%d drop=%d != stream %+v", sumSent, sumDrop, ss)
+	}
+	if ss.Dropped != ss.DroppedInflight+ss.DroppedQueued {
+		t.Fatalf("stream dropped split: %+v", ss)
+	}
+
+	// Repeated closes stay idempotent.
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ss2, _ := cli.StreamStats(st.ID())
+	if ss2 != ss {
+		t.Fatalf("second close changed the ledger: %+v != %+v", ss2, ss)
+	}
+
+	select {
+	case err := <-srvErr:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("server did not accept the stream")
+	}
+}
+
+// TestGroupPeerResetKeepsAttribution resets from the peer side: the
+// sender's unacked bytes are dropped under the group that sent them,
+// ACKs and the RST may interleave, and a local close after the peer
+// reset cannot move or re-count the charges.
+func TestGroupPeerResetKeepsAttribution(t *testing.T) {
+	c := sim.Config{LossRate: 0.1, MinDelay: time.Millisecond, MaxDelay: 8 * time.Millisecond}
+	pair := sim.NewPair(60224, c, c)
+	cfg := groupCfg()
+
+	srvErr := make(chan error, 1)
+	go func() {
+		srv, err := rdt.Accept(context.Background(), pair.B, cfg)
+		if err != nil {
+			srvErr <- err
+			return
+		}
+		st, err := srv.AcceptStream()
+		if err != nil {
+			srvErr <- err
+			return
+		}
+		srvErr <- st.Close() // RST the stream as soon as it appears
+	}()
+
+	cli, err := rdt.Dial(context.Background(), pair.A, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Abort()
+	st := cli.OpenStream()
+	st.SetGroup(5)
+	// Write blocks once the send buffer fills and unblocks with ErrClosed
+	// when the peer reset arrives.
+	go func() { _, _ = st.Write(makePayload(2000)) }()
+
+	// Wait for the peer reset to land and the ledger to settle.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		gs := cli.GroupStats(5)
+		if gs.Dropped > 0 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	gs := cli.GroupStats(5)
+	ss, _ := cli.StreamStats(st.ID())
+	if gs.DroppedInflight == 0 {
+		t.Fatalf("peer reset dropped no in-flight bytes: %+v", gs)
+	}
+	if gs.Sent != gs.Acked+gs.Inflight+gs.DroppedInflight || gs.Inflight != 0 {
+		t.Fatalf("group 5 ledger unbalanced after peer reset: %+v", gs)
+	}
+	if gs.Dropped != gs.DroppedInflight+gs.DroppedQueued {
+		t.Fatalf("group 5 dropped split: %+v", gs)
+	}
+	if ss.Dropped != gs.Dropped || ss.DroppedInflight != gs.DroppedInflight {
+		t.Fatalf("stream %+v vs group %+v after peer reset", ss, gs)
+	}
+
+	// A local close after the peer reset is a no-op for the ledger.
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	gs2 := cli.GroupStats(5)
+	ss2, _ := cli.StreamStats(st.ID())
+	if gs2 != gs || ss2 != ss {
+		t.Fatalf("close after peer reset changed the ledger: %+v %+v", gs2, ss2)
+	}
+
+	select {
+	case err := <-srvErr:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("server did not reset the stream")
 	}
 }

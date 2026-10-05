@@ -10,7 +10,9 @@ type streamState struct {
 	id uint32
 
 	group                            uint32
-	statSent, statAcked, statDropped uint64
+	statSent, statAcked              uint64
+	statDroppedInflight              uint64
+	statDroppedQueued                uint64
 
 	sndUna        uint64
 	sndNxt        uint64

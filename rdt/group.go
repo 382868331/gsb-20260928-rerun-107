@@ -9,7 +9,14 @@ type GroupStats struct {
 	Sent     uint64 // bytes transmitted (first send only, retransmits excluded)
 	Acked    uint64 // bytes acknowledged by the peer
 	Inflight uint64 // sent but not yet acked or dropped
-	Dropped  uint64 // in-flight bytes discarded by stream reset/cancel
+	Dropped  uint64 // bytes discarded by stream reset/cancel (in-flight + queued)
+	// DroppedInflight is the part of Dropped that had already been
+	// transmitted but not yet acknowledged; it is included in Sent, so
+	// the ledger balances as Sent == Acked + Inflight + DroppedInflight.
+	DroppedInflight uint64
+	// DroppedQueued is the part of Dropped still waiting in the send
+	// buffer; it was never transmitted and is not included in Sent.
+	DroppedQueued uint64
 }
 
 // StreamStats is a point-in-time accounting snapshot for one stream.
@@ -19,16 +26,21 @@ type StreamStats struct {
 	Acked    uint64
 	Inflight uint64
 	Dropped  uint64 // unacked + queued bytes discarded by reset/cancel
+	// DroppedInflight and DroppedQueued split Dropped the same way as
+	// the group-level counters; Dropped == DroppedInflight + DroppedQueued.
+	DroppedInflight uint64
+	DroppedQueued   uint64
 }
 
 type groupState struct {
-	id       uint32
-	weight   uint64
-	inflight uint64
-	sent     uint64
-	acked    uint64
-	dropped  uint64
-	cursor   int // round-robin cursor over Session.streamOrder
+	id              uint32
+	weight          uint64
+	inflight        uint64
+	sent            uint64
+	acked           uint64
+	droppedInflight uint64
+	droppedQueued   uint64
+	cursor          int // round-robin cursor over Session.streamOrder
 }
 
 const defaultGroupID = uint32(0)
@@ -148,11 +160,13 @@ func (s *Session) GroupStats(id uint32) GroupStats {
 		return GroupStats{}
 	}
 	return GroupStats{
-		Weight:   g.weight,
-		Sent:     g.sent,
-		Acked:    g.acked,
-		Inflight: g.inflight,
-		Dropped:  g.dropped,
+		Weight:          g.weight,
+		Sent:            g.sent,
+		Acked:           g.acked,
+		Inflight:        g.inflight,
+		Dropped:         g.droppedInflight + g.droppedQueued,
+		DroppedInflight: g.droppedInflight,
+		DroppedQueued:   g.droppedQueued,
 	}
 }
 
@@ -165,11 +179,13 @@ func (s *Session) StreamStats(id uint32) (StreamStats, bool) {
 		return StreamStats{}, false
 	}
 	return StreamStats{
-		Group:    st.group,
-		Sent:     st.statSent,
-		Acked:    st.statAcked,
-		Inflight: st.sndNxt - st.sndUna,
-		Dropped:  st.statDropped,
+		Group:           st.group,
+		Sent:            st.statSent,
+		Acked:           st.statAcked,
+		Inflight:        st.sndNxt - st.sndUna,
+		Dropped:         st.statDroppedInflight + st.statDroppedQueued,
+		DroppedInflight: st.statDroppedInflight,
+		DroppedQueued:   st.statDroppedQueued,
 	}, true
 }
 
@@ -195,18 +211,27 @@ func (s *Session) releaseSegLocked(st *streamState, seg *outSeg) {
 	st.statAcked += n
 }
 
-// dropStreamLocked discards queued and unacked bytes (reset/cancel),
-// charging each dropped segment to the group that sent it.
+// dropStreamLocked discards queued and unacked bytes (reset/cancel).
+// Unacked segments are charged to the group that sent them; queued
+// chunks are charged to the group their bytes were written under.
+// Neither touches the other group's ledger, and because both stores are
+// cleared here a repeated reset/close finds nothing and cannot
+// double-count.
 func (s *Session) dropStreamLocked(st *streamState) {
 	for _, seg := range st.segments {
 		g := s.groupLocked(seg.group)
 		n := uint64(len(seg.data))
 		g.inflight -= n
-		g.dropped += n
+		g.droppedInflight += n
 		s.inflightTotal -= n
-		st.statDropped += n
+		st.statDroppedInflight += n
 	}
 	st.segments = make(map[uint64]*outSeg)
-	st.statDropped += uint64(st.queuedLen())
+	for _, c := range st.queued {
+		g := s.groupLocked(c.group)
+		n := uint64(len(c.data))
+		g.droppedQueued += n
+		st.statDroppedQueued += n
+	}
 	st.queued = nil
 }
