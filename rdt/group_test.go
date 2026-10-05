@@ -542,3 +542,338 @@ func TestGroupHalfCloseReplayable(t *testing.T) {
 		t.Fatalf("decisions incomplete: data=%v lost=%v fin=%v finack=%v", data, lost, fin, finAck)
 	}
 }
+
+// waitStreamStats polls the stream stats until cond holds or the deadline
+// passes, failing the test on timeout.
+func waitStreamStats(t *testing.T, s *rdt.Session, id uint32, what string, cond func(rdt.StreamStats) bool) rdt.StreamStats {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		st, ok := s.StreamStats(id)
+		if ok && cond(st) {
+			return st
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	st, _ := s.StreamStats(id)
+	t.Fatalf("stream %d stats never satisfied %s: %+v", id, what, st)
+	return rdt.StreamStats{}
+}
+
+// cancelCfg returns a config whose receive window admits exactly one
+// 4-byte segment and then stays shut while the server never reads.
+func cancelCfg() rdt.Config {
+	cfg := groupCfg()
+	cfg.MaxSegment = 4
+	cfg.SendBuffer = 64
+	cfg.RecvBuffer = 4
+	return cfg
+}
+
+// TestGroupCancelAttributesQueuedDrops is the regression test for queued
+// (never sent) bytes missing from the per-group drop ledger: 6 bytes are
+// written in the old group, then 6 more after switching to a new group,
+// while the receive window lets only 4 bytes be acknowledged. Cancelling
+// the stream must drop 8 bytes at stream level, split 2 (old group
+// remainder) and 6 (new group) at group level, without confusing
+// sent-but-unacked drops with never-sent ones.
+func TestGroupCancelAttributesQueuedDrops(t *testing.T) {
+	c := sim.Config{LossRate: 0, MinDelay: time.Millisecond, MaxDelay: 3 * time.Millisecond}
+	pair := sim.NewPair(777001, c, c)
+	cfg := cancelCfg()
+
+	srvErr := make(chan error, 1)
+	go func() {
+		srv, err := rdt.Accept(context.Background(), pair.B, cfg)
+		if err != nil {
+			srvErr <- err
+			return
+		}
+		if _, err := srv.AcceptStream(); err != nil {
+			srvErr <- err
+			return
+		}
+		// Never read: the receive window stays shut after 4 bytes.
+		time.Sleep(2 * time.Second)
+		srvErr <- nil
+	}()
+
+	cli, err := rdt.Dial(context.Background(), pair.A, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := cli.OpenStream()
+	st.SetGroup(1)
+	if _, err := st.Write(makePayload(6)); err != nil {
+		t.Fatal(err)
+	}
+	st.SetGroup(2)
+	if _, err := st.Write(makePayload(6)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Only the first 4 bytes fit the receive window and get acked; the
+	// old group's remaining 2 bytes and all 6 of the new group sit queued.
+	waitStreamStats(t, cli, st.ID(), "acked=4 inflight=0", func(ss rdt.StreamStats) bool {
+		return ss.Acked == 4 && ss.Inflight == 0
+	})
+
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	g1 := cli.GroupStats(1)
+	if g1.Sent != 4 || g1.Acked != 4 || g1.Inflight != 0 || g1.Dropped != 2 {
+		t.Fatalf("group 1 (old) stats: %+v, want sent=4 acked=4 dropped=2", g1)
+	}
+	g2 := cli.GroupStats(2)
+	if g2.Sent != 0 || g2.Acked != 0 || g2.Inflight != 0 || g2.Dropped != 6 {
+		t.Fatalf("group 2 (new) stats: %+v, want sent=0 dropped=6", g2)
+	}
+	ss, ok := cli.StreamStats(st.ID())
+	if !ok {
+		t.Fatal("stream stats missing")
+	}
+	if ss.Sent != 4 || ss.Acked != 4 || ss.Dropped != 8 {
+		t.Fatalf("stream stats: %+v, want sent=4 acked=4 dropped=8", ss)
+	}
+	if g1.Dropped+g2.Dropped != ss.Dropped {
+		t.Fatalf("group drops %d+%d != stream drops %d", g1.Dropped, g2.Dropped, ss.Dropped)
+	}
+	// Repeating the close must not record the drop a second time.
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(3 * cfg.RTO)
+	if g := cli.GroupStats(1); g != g1 {
+		t.Fatalf("group 1 changed after repeated close: %+v -> %+v", g1, g)
+	}
+	if g := cli.GroupStats(2); g != g2 {
+		t.Fatalf("group 2 changed after repeated close: %+v -> %+v", g2, g)
+	}
+	if ss2, _ := cli.StreamStats(st.ID()); ss2.Dropped != ss.Dropped {
+		t.Fatalf("stream dropped changed after repeated close: %d -> %d", ss.Dropped, ss2.Dropped)
+	}
+	select {
+	case err := <-srvErr:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("server did not finish")
+	}
+}
+
+// TestGroupCancelInterleavedAcksBalance cancels while acknowledgements
+// are still arriving under loss, so the drop mixes sent-but-unacked
+// segments with never-sent queued chunks. Exact counts are racy, but the
+// ledger must stay balanced: every written byte ends up acked or dropped,
+// in every group and in the stream totals.
+func TestGroupCancelInterleavedAcksBalance(t *testing.T) {
+	c := sim.Config{LossRate: 0.2, MinDelay: time.Millisecond, MaxDelay: 6 * time.Millisecond}
+	pair := sim.NewPair(777003, c, c)
+	cfg := groupCfg()
+
+	srvErr := make(chan error, 1)
+	go func() {
+		srv, err := rdt.Accept(context.Background(), pair.B, cfg)
+		if err != nil {
+			srvErr <- err
+			return
+		}
+		st, err := srv.AcceptStream()
+		if err != nil {
+			srvErr <- err
+			return
+		}
+		buf := make([]byte, 64)
+		for {
+			if _, err := st.Read(buf); err != nil {
+				srvErr <- nil
+				return
+			}
+		}
+	}()
+
+	cli, err := rdt.Dial(context.Background(), pair.A, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := cli.OpenStream()
+	written := map[uint32]uint64{1: 100, 2: 150, 3: 120}
+	for _, step := range []struct{ g uint32; n int }{{1, 100}, {2, 150}, {3, 120}} {
+		st.SetGroup(step.g)
+		if _, err := st.Write(makePayload(step.n)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Cancel immediately: in-flight segments race with their acks, and
+	// the rest is still queued.
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var total uint64
+	var sumSent, sumAcked, sumDropped uint64
+	for id, w := range written {
+		total += w
+		g := cli.GroupStats(id)
+		if g.Acked+g.Dropped != w || g.Inflight != 0 {
+			t.Fatalf("group %d ledger unbalanced: %+v, written=%d", id, g, w)
+		}
+		if g.Sent < g.Acked || g.Dropped < g.Sent-g.Acked {
+			t.Fatalf("group %d sent/acked/dropped inconsistent: %+v", id, g)
+		}
+		sumSent += g.Sent
+		sumAcked += g.Acked
+		sumDropped += g.Dropped
+	}
+	ss, ok := cli.StreamStats(st.ID())
+	if !ok {
+		t.Fatal("stream stats missing")
+	}
+	if ss.Sent != sumSent || ss.Acked != sumAcked || ss.Dropped != sumDropped {
+		t.Fatalf("stream ledger %+v vs group sums sent=%d acked=%d dropped=%d",
+			ss, sumSent, sumAcked, sumDropped)
+	}
+	if ss.Acked+ss.Dropped != total || ss.Dropped == 0 {
+		t.Fatalf("stream ledger unbalanced: %+v, written=%d", ss, total)
+	}
+	// A repeated close must not record anything again.
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(3 * cfg.RTO)
+	for id, w := range written {
+		if g := cli.GroupStats(id); g.Acked+g.Dropped != w || g.Inflight != 0 {
+			t.Fatalf("group %d ledger changed after repeated close: %+v", id, g)
+		}
+	}
+	if ss2, _ := cli.StreamStats(st.ID()); ss2.Dropped != ss.Dropped {
+		t.Fatalf("stream dropped changed after repeated close: %d -> %d", ss.Dropped, ss2.Dropped)
+	}
+	select {
+	case err := <-srvErr:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("server did not finish")
+	}
+}
+
+// TestGroupCancelLedgerMultiSwitch exercises several group switches with
+// different chunk splits while acknowledgements arrive between them, then
+// cancels: every group's ledger must balance (sent = acked + dropped) and
+// the group totals must equal the stream totals.
+func TestGroupCancelLedgerMultiSwitch(t *testing.T) {
+	c := sim.Config{LossRate: 0, MinDelay: time.Millisecond, MaxDelay: 3 * time.Millisecond}
+	pair := sim.NewPair(777002, c, c)
+	cfg := cancelCfg()
+
+	srvErr := make(chan error, 1)
+	go func() {
+		srv, err := rdt.Accept(context.Background(), pair.B, cfg)
+		if err != nil {
+			srvErr <- err
+			return
+		}
+		if _, err := srv.AcceptStream(); err != nil {
+			srvErr <- err
+			return
+		}
+		// Never read: the window shuts after the first segment and every
+		// ack carries window 0, so no late or reordered ack can reopen it.
+		time.Sleep(2 * time.Second)
+		srvErr <- nil
+	}()
+
+	cli, err := rdt.Dial(context.Background(), pair.A, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := cli.OpenStream()
+	// The window admits exactly 4 bytes in total, and sends consume the
+	// queue in write order, so the split is deterministic no matter how
+	// the writes interleave with the acknowledgements: group 1 sends its
+	// 3-byte chunk, group 2 gets 1 byte of its 5-byte chunk out, and the
+	// rest stays queued until the cancel.
+	st.SetGroup(1)
+	if _, err := st.Write(makePayload(3)); err != nil {
+		t.Fatal(err)
+	}
+	st.SetGroup(2)
+	if _, err := st.Write(makePayload(5)); err != nil {
+		t.Fatal(err)
+	}
+	st.SetGroup(3)
+	if _, err := st.Write(makePayload(7)); err != nil {
+		t.Fatal(err)
+	}
+	st.SetGroup(1)
+	if _, err := st.Write(makePayload(2)); err != nil {
+		t.Fatal(err)
+	}
+	st.SetGroup(2)
+	if _, err := st.Write(makePayload(6)); err != nil {
+		t.Fatal(err)
+	}
+
+	// The 4 window bytes are acknowledged before the cancel.
+	waitStreamStats(t, cli, st.ID(), "acked=4 inflight=0", func(ss rdt.StreamStats) bool {
+		return ss.Acked == 4 && ss.Inflight == 0
+	})
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	want := map[uint32]rdt.GroupStats{
+		1: {Sent: 3, Acked: 3, Dropped: 2},
+		2: {Sent: 1, Acked: 1, Dropped: 10},
+		3: {Sent: 0, Acked: 0, Dropped: 7},
+	}
+	written := map[uint32]uint64{1: 5, 2: 11, 3: 7}
+	var sumSent, sumAcked, sumDropped uint64
+	for id, w := range want {
+		g := cli.GroupStats(id)
+		if g.Sent != w.Sent || g.Acked != w.Acked || g.Inflight != 0 || g.Dropped != w.Dropped {
+			t.Fatalf("group %d: got %+v want %+v", id, g, w)
+		}
+		// Every byte written in the group ends up acked or dropped, and
+		// the sent-but-unacked part of the drop never exceeds sent-acked.
+		if g.Acked+g.Dropped != written[id] || g.Sent < g.Acked || g.Dropped < g.Sent-g.Acked {
+			t.Fatalf("group %d ledger unbalanced: %+v", id, g)
+		}
+		sumSent += g.Sent
+		sumAcked += g.Acked
+		sumDropped += g.Dropped
+	}
+	ss, ok := cli.StreamStats(st.ID())
+	if !ok {
+		t.Fatal("stream stats missing")
+	}
+	if ss.Sent != sumSent || ss.Acked != sumAcked || ss.Dropped != sumDropped || ss.Inflight != 0 {
+		t.Fatalf("stream ledger %+v vs group sums sent=%d acked=%d dropped=%d",
+			ss, sumSent, sumAcked, sumDropped)
+	}
+	// A repeated close must not record anything again.
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(3 * cfg.RTO)
+	for id := range want {
+		g := cli.GroupStats(id)
+		if g.Acked+g.Dropped != written[id] || g.Inflight != 0 {
+			t.Fatalf("group %d ledger changed after repeated close: %+v", id, g)
+		}
+	}
+	if ss2, _ := cli.StreamStats(st.ID()); ss2.Dropped != ss.Dropped {
+		t.Fatalf("stream dropped changed after repeated close: %d -> %d", ss.Dropped, ss2.Dropped)
+	}
+	select {
+	case err := <-srvErr:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("server did not finish")
+	}
+}

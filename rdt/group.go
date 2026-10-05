@@ -9,7 +9,7 @@ type GroupStats struct {
 	Sent     uint64 // bytes transmitted (first send only, retransmits excluded)
 	Acked    uint64 // bytes acknowledged by the peer
 	Inflight uint64 // sent but not yet acked or dropped
-	Dropped  uint64 // in-flight bytes discarded by stream reset/cancel
+	Dropped  uint64 // unacked + queued bytes discarded by stream reset/cancel
 }
 
 // StreamStats is a point-in-time accounting snapshot for one stream.
@@ -196,7 +196,11 @@ func (s *Session) releaseSegLocked(st *streamState, seg *outSeg) {
 }
 
 // dropStreamLocked discards queued and unacked bytes (reset/cancel),
-// charging each dropped segment to the group that sent it.
+// charging each dropped byte to the group it was pinned to: in-flight
+// segments settle against the group that transmitted them, while queued
+// chunks were never charged to any group's in-flight total, so they only
+// add to the dropped ledger of the group active when they were written.
+// Keeping the two kinds of drop separate avoids double counting.
 func (s *Session) dropStreamLocked(st *streamState) {
 	for _, seg := range st.segments {
 		g := s.groupLocked(seg.group)
@@ -207,6 +211,11 @@ func (s *Session) dropStreamLocked(st *streamState) {
 		st.statDropped += n
 	}
 	st.segments = make(map[uint64]*outSeg)
-	st.statDropped += uint64(st.queuedLen())
+	for _, c := range st.queued {
+		g := s.groupLocked(c.group)
+		n := uint64(len(c.data))
+		g.dropped += n
+		st.statDropped += n
+	}
 	st.queued = nil
 }
